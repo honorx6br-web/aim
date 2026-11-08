@@ -135,6 +135,7 @@ jobs:
           import kotlin.math.abs
           import kotlin.math.hypot
           import kotlin.math.max
+          import kotlin.math.min
           import kotlin.math.sqrt
 
           class MainActivity : Activity() {
@@ -341,7 +342,6 @@ jobs:
               // Tunable numbers
               private val EDGE_MIN = 120          // lower = more edges (more sensitive)
               private val CIRCLE_FILL = 5.0f      // how complete a circle must be (lower = accepts weaker circles)
-              private val POCKET_MARGIN = 0.11f   // ignore circles this close to the left/right edge (pockets)
 
               private var bufN = 0
               private var cr = IntArray(0)
@@ -498,57 +498,107 @@ jobs:
                   return out
               }
 
+              // Fixed spots of the 8 printed orange circles, as fractions of the board (pocket to pocket).
+              private val decor = floatArrayOf(
+                  0.193f, 0.113f, 0.807f, 0.113f,
+                  0.118f, 0.192f, 0.882f, 0.192f,
+                  0.118f, 0.805f, 0.882f, 0.805f,
+                  0.193f, 0.884f, 0.807f, 0.884f
+              )
+
               private fun process(img: Image, w: Int, h: Int, k: Float, view: AimView) {
                   val all = findCircles(img, w, h)
-                  val side = w * POCKET_MARGIN
-                  val cs = all.filter { it.x > side && it.x < w - side }
+                  val wf = w.toFloat()
 
-                  // Striker = the biggest round thing in the lower half that has smaller round pieces on the board.
-                  var st: Circle? = null
-                  var coins: List<Circle> = emptyList()
-                  for (s in cs.sortedByDescending { it.r }) {
-                      if (s.y < h * 0.5f) continue
-                      val cl = cs.filter { it !== s && it.r >= s.r * 0.5f && it.r <= s.r * 0.93f }
-                      if (cl.isNotEmpty()) {
-                          st = s
-                          coins = cl
-                          break
+                  // 1) find the board from its two bottom pockets (big round holes in the corners)
+                  val pockets = all.filter { it.r >= 0.036f * wf && (it.x < 0.2f * wf || it.x > 0.8f * wf) }
+                  var pl: Circle? = null
+                  var pr: Circle? = null
+                  var span = 0f
+                  for (l in pockets) {
+                      if (l.x > 0.2f * wf) continue
+                      for (r in pockets) {
+                          if (r.x < 0.8f * wf) continue
+                          val sp = r.x - l.x
+                          if (sp < 0.7f * wf || abs(l.y - r.y) > 0.03f * wf) continue
+                          var hasTop = false
+                          for (c in pockets) {
+                              if (abs(c.y - (l.y - sp)) < 0.08f * sp && abs(c.x - l.x) < 0.05f * sp) hasTop = true
+                          }
+                          if (hasTop && (pl == null || l.y > pl.y)) {
+                              pl = l
+                              pr = r
+                              span = sp
+                          }
                       }
                   }
-                  if (st == null) {
+                  val bl = pl
+                  val br = pr
+                  if (bl == null || br == null) {
+                      view.hide()
+                      return
+                  }
+                  val yb = (bl.y + br.y) / 2f
+                  val baseY = yb - 0.113f * span
+
+                  // 2) round things inside the board: the one sitting on the bottom baseline is the striker
+                  var st: Circle? = null
+                  var sd = Float.MAX_VALUE
+                  val coins = ArrayList<Circle>()
+                  for (c in all) {
+                      val fx = (c.x - bl.x) / span
+                      val fy = (yb - c.y) / span
+                      if (fx < 0.04f || fx > 0.96f || fy < 0.04f || fy > 0.96f) continue
+                      if (c.r > 0.07f * wf) continue
+                      var isDecor = false
+                      var j = 0
+                      while (j < decor.size) {
+                          if (hypot(fx - decor[j], fy - decor[j + 1]) * span < 0.8f * max(c.r, 0.022f * wf)) isDecor = true
+                          j += 2
+                      }
+                      if (isDecor) continue
+                      val dy = abs(c.y - baseY)
+                      if (dy <= 0.6f * c.r && fx > 0.2f && fx < 0.8f && dy < sd) {
+                          st = c
+                          sd = dy
+                      }
+                      coins.add(c)
+                  }
+                  val s = st
+                  if (s == null) {
                       view.hide()
                       return
                   }
 
+                  // 3) nearest piece in front of the striker
                   var target: Circle? = null
                   var best = Float.MAX_VALUE
                   for (c in coins) {
-                      val d = hypot(c.x - st.x, c.y - st.y)
-                      if (d <= st.r + c.r) continue
-                      // skip the printed baseline circles (same height as the striker)
-                      if (abs(c.y - st.y) < st.r * 1.2f) continue
+                      if (c === s) continue
+                      if (c.y > s.y - s.r) continue
+                      val d = hypot(c.x - s.x, c.y - s.y)
                       if (d < best) {
                           best = d
                           target = c
                       }
                   }
-
-                  val t = target
-                  if (t == null) {
+                  val tg = target
+                  if (tg == null) {
                       view.hide()
                       return
                   }
-                  val dx = t.x - st.x
-                  val dy = t.y - st.y
-                  val len = hypot(dx, dy)
+
+                  val dx = tg.x - s.x
+                  val dy2 = tg.y - s.y
+                  val len = hypot(dx, dy2)
                   val ux = dx / len
-                  val uy = dy / len
-                  val rS = st.r * k
-                  val rT = t.r * k
-                  val x1 = st.x * k + ux * (rS + 8f)
-                  val y1 = st.y * k + uy * (rS + 8f)
-                  val x2 = t.x * k - ux * (rT + 8f)
-                  val y2 = t.y * k - uy * (rT + 8f)
+                  val uy = dy2 / len
+                  val rS = min(s.r, 0.03f * wf) * k
+                  val rT = min(tg.r, 0.03f * wf) * k
+                  val x1 = s.x * k + ux * (rS + 8f)
+                  val y1 = s.y * k + uy * (rS + 8f)
+                  val x2 = tg.x * k - ux * (rT + 8f)
+                  val y2 = tg.y * k - uy * (rT + 8f)
                   if ((x2 - x1) * ux + (y2 - y1) * uy > 0f) {
                       view.show(x1, y1, x2, y2)
                   } else {
