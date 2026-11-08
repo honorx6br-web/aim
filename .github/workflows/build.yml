@@ -132,7 +132,9 @@ jobs:
           import android.widget.LinearLayout
           import android.widget.TextView
           import kotlin.math.PI
+          import kotlin.math.abs
           import kotlin.math.hypot
+          import kotlin.math.max
           import kotlin.math.sqrt
 
           class MainActivity : Activity() {
@@ -264,7 +266,7 @@ jobs:
                   wm = windowManager
                   val dm = DisplayMetrics()
                   windowManager.defaultDisplay.getRealMetrics(dm)
-                  val scale = 4
+                  val scale = 3
                   val w = dm.widthPixels / scale
                   val h = dm.heightPixels / scale
 
@@ -334,82 +336,205 @@ jobs:
                   }
               }
 
-              private class Blob(val x: Float, val y: Float, val a: Int)
+              private class Circle(val x: Float, val y: Float, val r: Float)
 
-              private fun blobs(mask: BooleanArray, w: Int, h: Int, minA: Int, maxA: Int): List<Blob> {
-                  val seen = BooleanArray(w * h)
-                  val st = IntArray(w * h)
-                  val out = ArrayList<Blob>()
-                  for (i0 in 0 until w * h) {
-                      if (!mask[i0] || seen[i0]) continue
-                      var sp = 0
-                      var a = 0
-                      var sx = 0L
-                      var sy = 0L
-                      st[sp++] = i0
-                      seen[i0] = true
-                      while (sp > 0) {
-                          val p = st[--sp]
-                          val x = p % w
-                          val y = p / w
-                          a++
-                          sx += x
-                          sy += y
-                          if (x > 0 && mask[p - 1] && !seen[p - 1]) { seen[p - 1] = true; st[sp++] = p - 1 }
-                          if (x < w - 1 && mask[p + 1] && !seen[p + 1]) { seen[p + 1] = true; st[sp++] = p + 1 }
-                          if (y > 0 && mask[p - w] && !seen[p - w]) { seen[p - w] = true; st[sp++] = p - w }
-                          if (y < h - 1 && mask[p + w] && !seen[p + w]) { seen[p + w] = true; st[sp++] = p + w }
+              // Tunable numbers
+              private val EDGE_MIN = 120          // lower = more edges (more sensitive)
+              private val CIRCLE_FILL = 5.0f      // how complete a circle must be (lower = accepts weaker circles)
+              private val POCKET_MARGIN = 0.11f   // ignore circles this close to the left/right edge (pockets)
+
+              private var bufN = 0
+              private var cr = IntArray(0)
+              private var cg = IntArray(0)
+              private var cb = IntArray(0)
+              private var acc = IntArray(0)
+              private var exs = IntArray(0)
+              private var eys = IntArray(0)
+              private var egx = FloatArray(0)
+              private var egy = FloatArray(0)
+
+              private fun ensure(n: Int) {
+                  if (bufN == n) return
+                  bufN = n
+                  cr = IntArray(n)
+                  cg = IntArray(n)
+                  cb = IntArray(n)
+                  acc = IntArray(n)
+                  val cap = n / 4
+                  exs = IntArray(cap)
+                  eys = IntArray(cap)
+                  egx = FloatArray(cap)
+                  egy = FloatArray(cap)
+              }
+
+              // Finds round shapes using edges only (no colour rules).
+              private fun findCircles(img: Image, w: Int, h: Int): List<Circle> {
+                  val n = w * h
+                  ensure(n)
+                  val plane = img.planes[0]
+                  val buf = plane.buffer
+                  val rs = plane.rowStride
+                  val ps = plane.pixelStride
+                  for (y in 0 until h) {
+                      var o = y * rs
+                      var i = y * w
+                      for (x in 0 until w) {
+                          cr[i] = buf.get(o).toInt() and 0xff
+                          cg[i] = buf.get(o + 1).toInt() and 0xff
+                          cb[i] = buf.get(o + 2).toInt() and 0xff
+                          i++
+                          o += ps
                       }
-                      if (a in minA..maxA) out.add(Blob(sx.toFloat() / a, sy.toFloat() / a, a))
+                  }
+
+                  // 1) edges (strongest of R, G, B at every pixel)
+                  val chans = arrayOf(cr, cg, cb)
+                  val cap = exs.size
+                  val minSq = EDGE_MIN * EDGE_MIN
+                  var ne = 0
+                  for (y in 1 until h - 1) {
+                      for (x in 1 until w - 1) {
+                          val i = y * w + x
+                          var bestSq = 0
+                          var bgx = 0
+                          var bgy = 0
+                          for (p in chans) {
+                              val gx = (p[i - w + 1] + 2 * p[i + 1] + p[i + w + 1]) - (p[i - w - 1] + 2 * p[i - 1] + p[i + w - 1])
+                              val gy = (p[i + w - 1] + 2 * p[i + w] + p[i + w + 1]) - (p[i - w - 1] + 2 * p[i - w] + p[i - w + 1])
+                              val sq = gx * gx + gy * gy
+                              if (sq > bestSq) {
+                                  bestSq = sq
+                                  bgx = gx
+                                  bgy = gy
+                              }
+                          }
+                          if (bestSq >= minSq && ne < cap) {
+                              val m = sqrt(bestSq.toFloat())
+                              exs[ne] = x
+                              eys[ne] = y
+                              egx[ne] = bgx / m
+                              egy[ne] = bgy / m
+                              ne++
+                          }
+                      }
+                  }
+
+                  // 2) every edge votes for possible circle centres along its gradient line
+                  val rMin = max(4, (w * 0.012f).toInt())
+                  val rMax = max(rMin + 2, (w * 0.06f).toInt())
+                  java.util.Arrays.fill(acc, 0)
+                  for (e in 0 until ne) {
+                      val x = exs[e]
+                      val y = eys[e]
+                      val ux = egx[e]
+                      val uy = egy[e]
+                      var r = rMin
+                      while (r <= rMax) {
+                          val ax = Math.round(x + ux * r)
+                          val ay = Math.round(y + uy * r)
+                          if (ax >= 0 && ax < w && ay >= 0 && ay < h) acc[ay * w + ax]++
+                          val bx = Math.round(x - ux * r)
+                          val by = Math.round(y - uy * r)
+                          if (bx >= 0 && bx < w && by >= 0 && by < h) acc[by * w + bx]++
+                          r++
+                      }
+                  }
+
+                  // 3) strongest local peaks are circle centre candidates
+                  val voteMin = max(10, (3.1f * rMin).toInt())
+                  val cand = ArrayList<Int>()
+                  for (y in 1 until h - 1) {
+                      for (x in 1 until w - 1) {
+                          val i = y * w + x
+                          val v = acc[i]
+                          if (v < voteMin) continue
+                          if (v < acc[i - 1] || v < acc[i + 1] || v < acc[i - w] || v < acc[i + w] ||
+                              v < acc[i - w - 1] || v < acc[i - w + 1] || v < acc[i + w - 1] || v < acc[i + w + 1]) continue
+                          cand.add(i)
+                      }
+                  }
+                  cand.sortByDescending { acc[it] }
+
+                  // 4) for each candidate find its radius from the edges around it
+                  val out = ArrayList<Circle>()
+                  val hist = IntArray(rMax + 3)
+                  val lim = minOf(cand.size, 80)
+                  for (ci in 0 until lim) {
+                      val c = cand[ci]
+                      val cx = c % w
+                      val cy = c / w
+                      java.util.Arrays.fill(hist, 0)
+                      for (e in 0 until ne) {
+                          val dx = exs[e] - cx
+                          if (dx > rMax + 1 || dx < -(rMax + 1)) continue
+                          val dy = eys[e] - cy
+                          if (dy > rMax + 1 || dy < -(rMax + 1)) continue
+                          val d = hypot(dx.toFloat(), dy.toFloat())
+                          if (d < rMin - 1f || d > rMax + 1f || d < 0.5f) continue
+                          val cs = (dx * egx[e] + dy * egy[e]) / d
+                          if (abs(cs) < 0.85f) continue
+                          hist[Math.round(d)]++
+                      }
+                      var bestScore = 0
+                      var bestR = 0
+                      for (r in rMin..rMax) {
+                          val s = hist[r - 1] + hist[r] + hist[r + 1]
+                          if (s > bestScore) {
+                              bestScore = s
+                              bestR = r
+                          }
+                      }
+                      if (bestR == 0 || bestScore < CIRCLE_FILL * bestR) continue
+                      var dup = false
+                      for (a in out) {
+                          if (hypot(a.x - cx, a.y - cy) < 0.8f * max(a.r, bestR.toFloat())) {
+                              dup = true
+                              break
+                          }
+                      }
+                      if (!dup) out.add(Circle(cx.toFloat(), cy.toFloat(), bestR.toFloat()))
+                      if (out.size >= 40) break
                   }
                   return out
               }
 
               private fun process(img: Image, w: Int, h: Int, k: Float, view: AimView) {
-                  val plane = img.planes[0]
-                  val buf = plane.buffer
-                  val rs = plane.rowStride
-                  val ps = plane.pixelStride
-                  val red = BooleanArray(w * h)
-                  val coin = BooleanArray(w * h)
-                  val hsv = FloatArray(3)
-                  for (y in 0 until h) {
-                      for (x in 0 until w) {
-                          val o = y * rs + x * ps
-                          val r = buf.get(o).toInt() and 0xff
-                          val g = buf.get(o + 1).toInt() and 0xff
-                          val b = buf.get(o + 2).toInt() and 0xff
-                          Color.RGBToHSV(r, g, b, hsv)
-                          val hh = hsv[0] / 2f
-                          val s = hsv[1] * 255f
-                          val v = hsv[2] * 255f
-                          val i = y * w + x
-                          // Red striker
-                          if (hh <= 15f && s >= 100f && v >= 100f) red[i] = true
-                          // Yellow/white coins and black coins
-                          if ((hh >= 20f && hh <= 35f && s >= 50f && v >= 150f) || v <= 50f) coin[i] = true
+                  val all = findCircles(img, w, h)
+                  val side = w * POCKET_MARGIN
+                  val cs = all.filter { it.x > side && it.x < w - side }
+
+                  // Striker = the biggest round thing in the lower half that has smaller round pieces on the board.
+                  var st: Circle? = null
+                  var coins: List<Circle> = emptyList()
+                  for (s in cs.sortedByDescending { it.r }) {
+                      if (s.y < h * 0.5f) continue
+                      val cl = cs.filter { it !== s && it.r >= s.r * 0.5f && it.r <= s.r * 0.93f }
+                      if (cl.isNotEmpty()) {
+                          st = s
+                          coins = cl
+                          break
                       }
                   }
+                  if (st == null) {
+                      view.hide()
+                      return
+                  }
 
-                  val total = w * h
-                  val strikers = blobs(red, w, h, maxOf(3, (total * 0.00016).toInt()), total)
-                  val coins = blobs(coin, w, h, maxOf(5, (total * 0.0003).toInt()), (total * 0.0065).toInt())
-                  val st = strikers.maxByOrNull { it.a }
-
-                  var target: Blob? = null
+                  var target: Circle? = null
                   var best = Float.MAX_VALUE
-                  if (st != null) {
-                      for (c in coins) {
-                          val d = hypot(c.x - st.x, c.y - st.y)
-                          if (d > w * 0.016f && d < best) {
-                              best = d
-                              target = c
-                          }
+                  for (c in coins) {
+                      val d = hypot(c.x - st.x, c.y - st.y)
+                      if (d <= st.r + c.r) continue
+                      // skip the printed baseline circles (same height as the striker)
+                      if (abs(c.y - st.y) < st.r * 1.2f) continue
+                      if (d < best) {
+                          best = d
+                          target = c
                       }
                   }
 
                   val t = target
-                  if (st == null || t == null) {
+                  if (t == null) {
                       view.hide()
                       return
                   }
@@ -418,8 +543,8 @@ jobs:
                   val len = hypot(dx, dy)
                   val ux = dx / len
                   val uy = dy / len
-                  val rS = sqrt(st.a / PI.toFloat()) * k
-                  val rT = sqrt(t.a / PI.toFloat()) * k
+                  val rS = st.r * k
+                  val rT = t.r * k
                   val x1 = st.x * k + ux * (rS + 8f)
                   val y1 = st.y * k + uy * (rS + 8f)
                   val x2 = t.x * k - ux * (rT + 8f)
